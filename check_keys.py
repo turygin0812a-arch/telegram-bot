@@ -19,7 +19,7 @@ ENV_PATH = Path(__file__).resolve().parent / ".env"
 
 CHAT_MODEL = "openrouter/free"
 VISION_MODEL = "google/gemma-3-12b-it:free"
-IMAGE_MODEL = "google/gemini-2.5-flash-preview"
+DEFAULT_IMAGE_MODEL = "google/gemini-2.5-flash-preview"
 TRANSCRIBE_MODEL = "openai/whisper-1"
 
 ok = True
@@ -107,13 +107,15 @@ def check_chat(key: str, ids: set[str]) -> None:
 
 def check_image(key: str) -> None:
     global ok
-    print(f"\n[4] Генерация картинок, модель {IMAGE_MODEL}")
+    # читаем уже после load_env(), чтобы подхватить значение из .env
+    model = os.getenv("IMAGE_MODEL", DEFAULT_IMAGE_MODEL)
+    print(f"\n[4] Генерация картинок, модель {model}")
     try:
         r = request(
             "https://openrouter.ai/api/v1/chat/completions",
             key,
             {
-                "model": IMAGE_MODEL,
+                "model": model,
                 "messages": [{"role": "user", "content": "A red circle on white background"}],
                 "modalities": ["image", "text"],
                 "max_tokens": 512,
