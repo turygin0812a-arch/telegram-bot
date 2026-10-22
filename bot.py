@@ -99,6 +99,9 @@ ai_client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=OPENROUTER_K
 
 MODEL_NAME = "openrouter/free"
 
+# Модель для генерации картинок (можно переопределить через .env)
+IMAGE_MODEL = os.getenv("IMAGE_MODEL", "google/gemini-2.5-flash-preview")
+
 SYSTEM_INSTRUCTION = (
     "Ты — личный ассистент программиста. Если тебя просят написать программу или исправить код, "
     "всегда пиши готовые скрипты внутри стандартных блоков разметки ```язык ... ```. "
@@ -414,12 +417,13 @@ async def handle_code_blocks(message: types.Message, ai_text: str):
         await message.answer_document(input_zip, caption="📦 Сгенерированные файлы упакованы в архив")
 
 
-# Ключевые слова для генерации картинок
+# Ключевые слова для генерации картинок.
+# Важно: без общих слов вроде «сгенерируй», иначе «сгенерируй функцию» уйдёт в рисование.
 IMAGE_KEYWORDS = [
-    "нарисуй", "нарисовать", "сгенерируй", "сгенерировать", "генерируй",
+    "нарисуй", "нарисовать", "изобрази",
     "создай картинку", "создай изображение", "создай рисунок",
-    "draw", "generate image", "create image", "imagine",
-    "покажи картинку", "нарисуй мне", "изобрази",
+    "покажи картинку", "покажи рисунок",
+    "draw me", "draw a", "draw an", "generate image", "create image", "make an image",
 ]
 
 
@@ -464,7 +468,7 @@ def generate_image(prompt: str) -> bytes:
     english_prompt = translate_to_english(prompt)
 
     response = ai_client.chat.completions.create(
-        model="google/gemini-2.5-flash-preview",
+        model=IMAGE_MODEL,
         messages=[{"role": "user", "content": english_prompt}],
         extra_body={"modalities": ["image", "text"]},
         max_tokens=512,
@@ -678,6 +682,33 @@ async def file_handler(message: types.Message):
 async def text_processing(user_id: int, user_text: str, message: types.Message):
     user_msg_id = message.message_id
 
+    if is_image_request(user_text):
+        await bot.send_chat_action(chat_id=message.chat.id, action="upload_photo")
+        save_message(user_id, "user", user_text, user_msg_id)
+        status = await message.answer(f"🎨 Рисую через {IMAGE_MODEL}…")
+        try:
+            loop = asyncio.get_event_loop()
+            img_bytes = await asyncio.wait_for(
+                loop.run_in_executor(None, generate_image, user_text),
+                timeout=180.0,
+            )
+            photo = BufferedInputFile(img_bytes, filename="generated.png")
+            try:
+                await status.delete()
+            except Exception:
+                pass
+            sent = await message.answer_photo(photo, caption=f"🎨 {user_text}"[:1024])
+            save_message(user_id, "model", f"[Картинка] {user_text}", sent.message_id)
+        except Exception as e:
+            error_text = str(e)
+            hint = ""
+            if "402" in error_text or "insufficient" in error_text.lower():
+                hint = "\n💡 Похоже, у ключа закончились кредиты OpenRouter."
+            elif "404" in error_text or "not found" in error_text.lower():
+                hint = f"\n💡 Модель {IMAGE_MODEL} недоступна — задай другую через IMAGE_MODEL в .env."
+            await message.answer(f"❌ Не удалось нарисовать: {error_text}{hint}")
+        return
+
     if is_weather_request(user_text):
         city = detect_city_from_text(user_text)
         if city:
@@ -724,6 +755,7 @@ async def main():
     print("🧠 Контекст диалога: активен")
     print("🎤 Голосовые сообщения: активны (Whisper)")
     print("📄 PDF: активен (pypdf)")
+    print(f"🎨 Картинки: {IMAGE_MODEL}")
     print(f"🌤 Погода: {'активна (WeatherAPI)' if WEATHER_API_KEY else 'не настроена'}")
     print("=" * 50)
 
