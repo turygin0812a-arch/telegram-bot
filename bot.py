@@ -8,7 +8,6 @@ import base64
 import urllib.request
 import urllib.parse
 import json
-import time
 from datetime import datetime
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, Command
@@ -93,315 +92,7 @@ HF_TOKEN = os.getenv("HF_TOKEN")
 if not TELEGRAM_TOKEN or not OPENROUTER_KEY:
     raise RuntimeError("❌ Не найдены TELEGRAM_TOKEN или OPENROUTER_KEY в файле .env")
 
-# Прокси из .env (резервный вариант)
-PROXY_URL = os.getenv("PROXY_URL")
-
-# ============================================
-# СИСТЕМА АВТООБНОВЛЕНИЯ ПРОКСИ ИЗ @kyravpn
-# ============================================
-
-PROXY_CHANNEL = "@kyravpn"  # Telegram канал с прокси
-PROXY_UPDATE_INTERVAL = 1800  # Интервал обновления в секундах (30 минут)
-
-# Кэш прокси
-_proxy_cache = {
-    "proxies": [],
-    "last_update": 0,
-    "current_index": 0,
-    "failed_proxies": set()  # Прокси которые не работают
-}
-
-
-def parse_proxies_from_text(text: str) -> list:
-    """Парсит прокси из текста канала (только SOCKS4/5 и HTTP/HTTPS, НЕ MTProto)"""
-    proxies = []
-
-    # Пропускаем MTProto / tg:// прокси — они не подходят для бота
-    # Ищем только socks4, socks5, http, https
-    uri_pattern = r'(socks[45]|https?)://(?:([^:]+):([^@]+)@)?([^:/\s]+):(\d+)'
-    for match in re.finditer(uri_pattern, text, re.IGNORECASE):
-        full_match = match.group(0)
-
-        # Пропускаем если это часть tg:// ссылки
-        start = match.start()
-        if start > 5 and 'tg://' in text[max(0, start - 20):start]:
-            continue
-
-        proxy_type, user, passwd, host, port = match.groups()
-
-        # Пропускаем MTProto параметры (secret, server в tg:// формате)
-        if 'secret=' in full_match or 'tg://' in full_match:
-            continue
-
-        proxy = {
-            "type": proxy_type.lower(),
-            "host": host,
-            "port": port,
-            "url": match.group(0)
-        }
-        if user and passwd:
-            proxy["username"] = user
-            proxy["password"] = passwd
-            proxy["url"] = f"{proxy_type.lower()}://{user}:{passwd}@{host}:{port}"
-        else:
-            proxy["url"] = f"{proxy_type.lower()}://{host}:{port}"
-        proxies.append(proxy)
-
-    # Формат IP:PORT:USER:PASS
-    cred_pattern = r'(\d+\.\d+\.\d+\.\d+):(\d+):([^:\s]+):([^\s]+)'
-    for match in re.finditer(cred_pattern, text):
-        host, port, user, passwd = match.groups()
-        # Проверяем что такого прокси ещё нет
-        if not any(p["host"] == host and p["port"] == port for p in proxies):
-            proxies.append({
-                "type": "socks5",
-                "host": host,
-                "port": port,
-                "username": user,
-                "password": passwd,
-                "url": f"socks5://{user}:{passwd}@{host}:{port}"
-            })
-
-    # Простой формат IP:PORT (без авторизации)
-    simple_pattern = r'(\d+\.\d+\.\d+\.\d+):(\d+)(?![:\d])'
-    for match in re.finditer(simple_pattern, text):
-        host, port = match.groups()
-        if not any(p["host"] == host and p["port"] == port for p in proxies):
-            proxies.append({
-                "type": "http",
-                "host": host,
-                "port": port,
-                "url": f"http://{host}:{port}"
-            })
-
-    return proxies
-
-
-def fetch_proxies_from_channel() -> list:
-    """Загружает прокси из Telegram канала через публичный веб-интерфейс"""
-    global _proxy_cache
-
-    current_time = time.time()
-
-    # Проверяем кэш
-    if _proxy_cache["proxies"] and (current_time - _proxy_cache["last_update"]) < PROXY_UPDATE_INTERVAL:
-        return _proxy_cache["proxies"]
-
-    try:
-        # Используем публичный веб-интерфейс Telegram для чтения канала
-        channel_name = PROXY_CHANNEL.replace("@", "")
-        url = f"https://t.me/s/{channel_name}"
-
-        req = urllib.request.Request(url, headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8"
-        })
-
-        ctx = ssl.create_default_context()
-        with urllib.request.urlopen(req, timeout=15, context=ctx) as response:
-            html = response.read().decode("utf-8")
-
-        # Парсим прокси из HTML страницы канала
-        proxies = parse_proxies_from_text(html)
-
-        # Фильтруем ранее неработающие прокси
-        proxies = [p for p in proxies if p["url"] not in _proxy_cache["failed_proxies"]]
-
-        if proxies:
-            _proxy_cache["proxies"] = proxies
-            _proxy_cache["last_update"] = current_time
-            _proxy_cache["current_index"] = 0
-            print(f"✅ Загружено {len(proxies)} прокси из {PROXY_CHANNEL}")
-            for i, p in enumerate(proxies[:5]):  # Показываем первые 5
-                print(f"   {i + 1}. {p['type'].upper()} {p['host']}:{p['port']}")
-            if len(proxies) > 5:
-                print(f"   ... и ещё {len(proxies) - 5}")
-        else:
-            print(f"⚠️ Не найдено прокси в канале {PROXY_CHANNEL}")
-
-        return proxies
-
-    except Exception as e:
-        print(f"❌ Ошибка загрузки прокси из {PROXY_CHANNEL}: {e}")
-        return _proxy_cache["proxies"]  # Возвращаем кэш если есть
-
-
-def get_next_proxy() -> str | None:
-    """Возвращает следующий прокси из списка (ротация)"""
-    proxies = fetch_proxies_from_channel()
-
-    if not proxies:
-        return None
-
-    # Берём следующий прокси по кругу
-    proxy = proxies[_proxy_cache["current_index"] % len(proxies)]
-    _proxy_cache["current_index"] += 1
-
-    return proxy["url"]
-
-
-def mark_proxy_failed(proxy_url: str):
-    """Помечает прокси как неработающий"""
-    _proxy_cache["failed_proxies"].add(proxy_url)
-    print(f"⚠️ Прокси {proxy_url} помечен как неработающий")
-
-
-def is_valid_bot_proxy(url: str) -> bool:
-    """Проверяет что URL является валидным прокси для бота (не MTProto)"""
-    if not url:
-        return False
-    url_lower = url.lower().strip()
-    # Только socks4, socks5, http, https
-    valid_prefixes = ("socks5://", "socks4://", "http://", "https://")
-    if not any(url_lower.startswith(p) for p in valid_prefixes):
-        return False
-    # Отсекаем tg://, mtproto, secret=
-    bad_words = ("tg://", "mtproto", "secret=", "proxy?server")
-    if any(w in url_lower for w in bad_words):
-        return False
-    return True
-
-
-def get_working_proxy() -> str | None:
-    """Пытается найти работающий прокси"""
-    proxies = fetch_proxies_from_channel()
-
-    if not proxies:
-        # Проверяем резервный из .env
-        if is_valid_bot_proxy(PROXY_URL):
-            return PROXY_URL
-        return None
-
-    # Пробуем до 5 прокси
-    for _ in range(min(5, len(proxies))):
-        proxy_url = get_next_proxy()
-        if proxy_url and proxy_url not in _proxy_cache["failed_proxies"] and is_valid_bot_proxy(proxy_url):
-            return proxy_url
-
-    # Если все прокси из канала не работают — используем резервный
-    if is_valid_bot_proxy(PROXY_URL):
-        return PROXY_URL
-    return None
-
-
-def fetch_free_proxy() -> str | None:
-    """Пытается получить бесплатный прокси из публичных списков"""
-
-    # Сначала пробуем API
-    proxy_sources = [
-        "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks5&timeout=5000&country=all&ssl=all&anonymity=all",
-        "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=5000&country=all&ssl=all&anonymity=all",
-        "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/socks5.txt",
-        "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt",
-    ]
-
-    for source_url in proxy_sources:
-        try:
-            print(f"   Пробую: {source_url[:50]}...")
-            req = urllib.request.Request(source_url, headers={
-                "User-Agent": "Mozilla/5.0"
-            })
-            with urllib.request.urlopen(req, timeout=10) as response:
-                data = response.read().decode("utf-8")
-
-            # Парсим IP:PORT
-            lines = data.strip().split("\n")
-            for line in lines[:20]:  # Проверяем первые 20
-                line = line.strip()
-                if re.match(r'\d+\.\d+\.\d+\.\d+:\d+', line):
-                    proxy_type = "socks5" if "socks5" in source_url.lower() else "http"
-                    proxy_url = f"{proxy_type}://{line}"
-                    print(f"   ✅ Найден прокси: {proxy_url}")
-                    return proxy_url
-        except Exception as e:
-            print(f"   ❌ {e}")
-            continue
-
-    return None
-
-
-def test_proxy(proxy_url: str, timeout: int = 5) -> bool:
-    """Проверяет работоспособность прокси"""
-    try:
-        # Простая проверка — пытаемся подключиться к Telegram API
-        import socks
-        import socket as sock
-
-        # Парсим URL прокси
-        match = re.match(r'(socks[45]|https?)://(?:([^:]+):([^@]+)@)?([^:]+):(\d+)', proxy_url)
-        if not match:
-            return False
-
-        proxy_type_str, user, passwd, host, port = match.groups()
-
-        if 'socks5' in proxy_type_str.lower():
-            proxy_type = socks.SOCKS5
-        elif 'socks4' in proxy_type_str.lower():
-            proxy_type = socks.SOCKS4
-        else:
-            proxy_type = socks.HTTP
-
-        s = socks.socksocket()
-        s.set_proxy(proxy_type, host, int(port), username=user, password=passwd)
-        s.settimeout(timeout)
-        s.connect(("api.telegram.org", 443))
-        s.close()
-        return True
-    except ImportError:
-        # Если PySocks не установлен — пропускаем проверку
-        return True
-    except Exception:
-        return False
-
-
-# ============================================
-# СОЗДАНИЕ БОТА С АВТОПРОКСИ
-# ============================================
-
-def create_bot_with_auto_proxy() -> Bot:
-    """Создаёт бота с автоматическим выбором прокси"""
-    from aiogram.client.session.aiohttp import AiohttpSession
-
-    # 1. Пробуем получить прокси из канала @kyravpn
-    proxy_url = get_working_proxy()
-
-    if proxy_url and is_valid_bot_proxy(proxy_url):
-        try:
-            print(f"🌐 Используется прокси: {proxy_url}")
-            session = AiohttpSession(proxy=proxy_url)
-            return Bot(token=TELEGRAM_TOKEN, session=session)
-        except Exception as e:
-            print(f"⚠️ Ошибка прокси из канала: {e}")
-
-    # 2. Пробуем прокси из .env
-    if PROXY_URL and is_valid_bot_proxy(PROXY_URL):
-        try:
-            print(f"🌐 Используется PROXY_URL из .env: {PROXY_URL}")
-            session = AiohttpSession(proxy=PROXY_URL)
-            return Bot(token=TELEGRAM_TOKEN, session=session)
-        except Exception as e:
-            print(f"⚠️ Ошибка PROXY_URL из .env: {e}")
-
-    # 3. Пробуем бесплатные публичные прокси
-    print("🔍 Ищу бесплатный прокси...")
-    free_proxy = fetch_free_proxy()
-    if free_proxy:
-        try:
-            print(f"🌐 Используется бесплатный прокси: {free_proxy}")
-            session = AiohttpSession(proxy=free_proxy)
-            return Bot(token=TELEGRAM_TOKEN, session=session)
-        except Exception as e:
-            print(f"⚠️ Ошибка бесплатного прокси: {e}")
-
-    # 4. Без прокси (работает только если Telegram не заблокирован)
-    print("⚠️ Прокси не найден, подключаемся напрямую...")
-    print("   Если Telegram заблокирован — добавь PROXY_URL в .env")
-    return Bot(token=TELEGRAM_TOKEN)
-
-
-# Создаём бота с автопрокси
-bot = create_bot_with_auto_proxy()
+bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
 ai_client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=OPENROUTER_KEY)
@@ -663,7 +354,6 @@ def get_main_keyboard():
             ],
             [
                 KeyboardButton(text="🌤 Погода"),
-                KeyboardButton(text="🔄 Сменить прокси"),
             ],
         ],
         resize_keyboard=True,
@@ -828,15 +518,6 @@ def call_ai_with_image(img_bytes: bytes, user_comment: str) -> str:
 
 @dp.message(CommandStart())
 async def start_handler(message: types.Message):
-    # Показываем информацию о текущем прокси
-    proxy_info = ""
-    if _proxy_cache["proxies"]:
-        proxy_info = f"\n🌐 Прокси: активен (из @kyravpn, {len(_proxy_cache['proxies'])} доступно)"
-    elif PROXY_URL:
-        proxy_info = f"\n🌐 Прокси: {PROXY_URL[:30]}..."
-    else:
-        proxy_info = "\n🌐 Прокси: не используется"
-
     await message.answer(
         "👋 Привет! Я твой ИИ-помощник на базе OpenRouter.\n\n"
         "🧠 *Помню контекст разговора* — не нужно повторять себя.\n"
@@ -844,78 +525,9 @@ async def start_handler(message: types.Message):
         "🎤 *Голосовые сообщения* — просто надиктуй вопрос.\n"
         "📄 *Файлы кода и PDF* — прикрепи файл и задай вопрос.\n"
         "🌤 *Погода* — спроси 'погода в Москве' или нажми кнопку.\n"
-        f"{proxy_info}\n\n"
         "Поехали!",
         reply_markup=get_main_keyboard(),
         parse_mode="Markdown",
-    )
-
-
-@dp.message(F.text == "🔄 Сменить прокси")
-async def change_proxy_handler(message: types.Message):
-    """Принудительно меняет прокси на следующий из списка"""
-    global bot
-
-    await message.answer("🔄 Обновляю список прокси из @kyravpn...")
-
-    # Сбрасываем кэш чтобы загрузить свежие прокси
-    _proxy_cache["last_update"] = 0
-    _proxy_cache["failed_proxies"].clear()
-
-    proxies = fetch_proxies_from_channel()
-
-    if proxies:
-        new_proxy = get_next_proxy()
-        await message.answer(
-            f"✅ Загружено {len(proxies)} прокси\n"
-            f"🌐 Текущий: `{new_proxy}`\n\n"
-            f"⚠️ Для применения нового прокси перезапустите бота.",
-            parse_mode="Markdown",
-            reply_markup=get_main_keyboard()
-        )
-    else:
-        await message.answer(
-            "❌ Не удалось загрузить прокси из канала.\n"
-            f"Используется: {PROXY_URL or 'прямое подключение'}",
-            reply_markup=get_main_keyboard()
-        )
-
-
-@dp.message(Command("proxy"))
-async def proxy_status_handler(message: types.Message):
-    """Показывает статус прокси"""
-    proxies = _proxy_cache["proxies"]
-
-    if not proxies:
-        await message.answer(
-            "📡 *Статус прокси*\n\n"
-            f"Канал: {PROXY_CHANNEL}\n"
-            f"Загружено: 0 прокси\n"
-            f"Резервный: {PROXY_URL or 'не задан'}\n\n"
-            "Нажмите 🔄 Сменить прокси для загрузки",
-            parse_mode="Markdown"
-        )
-        return
-
-    last_update = datetime.fromtimestamp(_proxy_cache["last_update"]).strftime("%H:%M:%S") if _proxy_cache[
-        "last_update"] else "никогда"
-
-    proxy_list = "\n".join([
-        f"  {'🟢' if p['url'] not in _proxy_cache['failed_proxies'] else '🔴'} {p['type'].upper()} {p['host']}:{p['port']}"
-        for p in proxies[:10]
-    ])
-
-    if len(proxies) > 10:
-        proxy_list += f"\n  ... и ещё {len(proxies) - 10}"
-
-    await message.answer(
-        f"📡 *Статус прокси*\n\n"
-        f"Канал: {PROXY_CHANNEL}\n"
-        f"Загружено: {len(proxies)} прокси\n"
-        f"Неработающих: {len(_proxy_cache['failed_proxies'])}\n"
-        f"Обновлено: {last_update}\n\n"
-        f"*Список:*\n{proxy_list}",
-        parse_mode="Markdown"
     )
 
 
@@ -1113,15 +725,6 @@ async def main():
     print("🎤 Голосовые сообщения: активны (Whisper)")
     print("📄 PDF: активен (pypdf)")
     print(f"🌤 Погода: {'активна (WeatherAPI)' if WEATHER_API_KEY else 'не настроена'}")
-    print("-" * 50)
-    print(f"🌐 Канал прокси: {PROXY_CHANNEL}")
-    print(f"🔄 Интервал обновления: {PROXY_UPDATE_INTERVAL // 60} минут")
-    if _proxy_cache["proxies"]:
-        print(f"✅ Загружено {len(_proxy_cache['proxies'])} прокси")
-    elif PROXY_URL:
-        print(f"⚠️ Используется резервный прокси: {PROXY_URL}")
-    else:
-        print("⚠️ Прокси не настроен — прямое подключение")
     print("=" * 50)
 
     await dp.start_polling(bot)
