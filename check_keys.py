@@ -76,22 +76,25 @@ def check_openrouter_key(key: str) -> None:
         ok = False
 
 
-def check_models() -> set[str]:
+def check_models() -> dict[str, list[str]]:
     print("\n[2] Список моделей OpenRouter")
     try:
         models = request("https://openrouter.ai/api/v1/models")
-        ids = {m["id"] for m in models.get("data", [])}
-        print(f"    ✅ доступно моделей: {len(ids)}")
-        return ids
+        found = {
+            m["id"]: (m.get("architecture") or {}).get("output_modalities") or []
+            for m in models.get("data", [])
+        }
+        print(f"    ✅ доступно моделей: {len(found)}")
+        return found
     except RuntimeError as e:
         print(f"    ❌ не удалось получить список: {e}")
-        return set()
+        return {}
 
 
-def check_chat(key: str, ids: set[str]) -> None:
+def check_chat(key: str, models: dict[str, list[str]]) -> None:
     global ok
     print(f"\n[3] Чат, модель {CHAT_MODEL}")
-    if CHAT_MODEL not in ids:
+    if CHAT_MODEL not in models:
         print("    ⚠️ модели нет в публичном списке (может быть алиасом — всё равно пробуем)")
     try:
         r = request(
@@ -105,11 +108,12 @@ def check_chat(key: str, ids: set[str]) -> None:
         ok = False
 
 
-def check_image(key: str) -> None:
+def check_image(key: str, models: dict[str, list[str]]) -> None:
     global ok
     # читаем уже после load_env(), чтобы подхватить значение из .env
     model = os.getenv("IMAGE_MODEL", DEFAULT_IMAGE_MODEL)
     print(f"\n[4] Генерация картинок, модель {model}")
+    images = 0
     try:
         r = request(
             "https://openrouter.ai/api/v1/chat/completions",
@@ -122,7 +126,6 @@ def check_image(key: str) -> None:
             },
             timeout=120,
         )
-        images = 0
         for choice in r.get("choices", []):
             content = choice.get("message", {}).get("content")
             if isinstance(content, list):
@@ -134,11 +137,17 @@ def check_image(key: str) -> None:
                         print(f"    ✅ картинка получена: {size} байт")
         if not images:
             print(f"    ❌ ответ без изображения. Ключи ответа: {list(r)[:6]}, finish_reason={r['choices'][0].get('finish_reason')}")
-            ok = False
     except RuntimeError as e:
         print(f"    ❌ {e}")
         print("    💡 частая причина: у модели нет доступа к image-выходу или закончились кредиты")
+
+    if not images:
         ok = False
+        candidates = [mid for mid, outs in models.items() if "image" in outs]
+        if candidates:
+            print(f"    💡 модели с image-выходом ({len(candidates)}), можно указать в IMAGE_MODEL:")
+            for c in candidates[:10]:
+                print(f"       {c}")
 
 
 def check_weather(key: str | None) -> None:
@@ -161,9 +170,9 @@ def main() -> None:
         print("\n❌ OPENROUTER_KEY не задан в .env")
         sys.exit(2)
     check_openrouter_key(or_key)
-    ids = check_models()
-    check_chat(or_key, ids)
-    check_image(or_key)
+    models = check_models()
+    check_chat(or_key, models)
+    check_image(or_key, models)
     check_weather(os.getenv("WEATHER_API_KEY"))
 
     print("\n" + ("=" * 50))
