@@ -41,6 +41,7 @@
 telegram-bot/
 ├── bot.py            # весь бот: хендлеры, работа с ИИ, БД
 ├── check_keys.py     # проверка ключей и моделей из .env
+├── requirements.txt  # зависимости
 ├── chat_history.db   # создаётся автоматически при первом запуске
 └── .env              # секреты — в репозиторий не попадает
 ```
@@ -70,7 +71,7 @@ venv\Scripts\activate
 # Linux / macOS
 source venv/bin/activate
 
-pip install aiogram openai python-dotenv pypdf
+pip install -r requirements.txt
 ```
 
 ### Настройка `.env`
