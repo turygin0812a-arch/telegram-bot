@@ -1,4 +1,5 @@
 aiogram>=3.13
+aiohttp-socks>=0.8
 openai>=1.40
 python-dotenv>=1.0
 pypdf>=4.0
