@@ -18,6 +18,13 @@ import os
 import socket
 import ssl
 
+# Чтобы эмодзи в логах не роняли бота при перенаправленном выводе на Windows
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(errors="replace")
+    except Exception:
+        pass
+
 # Загрузка переменных из .env файла (ищем рядом с bot.py)
 from pathlib import Path
 
@@ -26,7 +33,7 @@ ENV_PATH = Path(__file__).resolve().parent / ".env"
 try:
     from dotenv import load_dotenv
 
-    loaded = load_dotenv(dotenv_path=ENV_PATH)
+    loaded = load_dotenv(dotenv_path=ENV_PATH, encoding="utf-8-sig")
     if loaded:
         print(f"✅ Загружен .env файл: {ENV_PATH}")
     else:
@@ -35,7 +42,7 @@ except ImportError:
     # Если dotenv не установлен — читаем .env вручную
     print("⚠️ python-dotenv не установлен, читаю .env вручную...")
     if ENV_PATH.exists():
-        with open(ENV_PATH, "r", encoding="utf-8") as f:
+        with open(ENV_PATH, "r", encoding="utf-8-sig") as f:
             for line in f:
                 line = line.strip()
                 if line and not line.startswith("#") and "=" in line:
@@ -85,22 +92,37 @@ def _patched_getaddrinfo(host, port, *args, **kwargs):
 socket.getaddrinfo = _patched_getaddrinfo
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-OPENROUTER_KEY = os.getenv("OPENROUTER_KEY")
 WEATHER_API_KEY = os.getenv("WEATHER_API_KEY")
-HF_TOKEN = os.getenv("HF_TOKEN")
 
-if not TELEGRAM_TOKEN or not OPENROUTER_KEY:
-    raise RuntimeError("❌ Не найдены TELEGRAM_TOKEN или OPENROUTER_KEY в файле .env")
+# === Провайдер моделей: любой OpenAI-совместимый API ===
+# По умолчанию ProxyAPI (работает из РФ). Вернуть OpenRouter можно двумя строками в .env:
+#   AI_BASE_URL=https://openrouter.ai/api/v1
+#   AI_API_KEY=<ключ OpenRouter>
+AI_BASE_URL = os.getenv("AI_BASE_URL", "https://api.proxyapi.ru/openai/v1")
+AI_API_KEY = (
+    os.getenv("AI_API_KEY")
+    or os.getenv("PROXYAPI_KEY")
+    or os.getenv("OPENROUTER_KEY")  # обратная совместимость со старым .env
+)
+
+if not TELEGRAM_TOKEN or not AI_API_KEY:
+    raise RuntimeError("❌ Не найдены TELEGRAM_TOKEN или AI_API_KEY в файле .env")
 
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-ai_client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=OPENROUTER_KEY)
+ai_client = OpenAI(base_url=AI_BASE_URL, api_key=AI_API_KEY)
 
-MODEL_NAME = "openrouter/free"
+# Имена моделей должны совпадать с каталогом провайдера
+CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4o-mini")
+VISION_MODEL = os.getenv("VISION_MODEL", "gpt-4o-mini")
+TRANSCRIBE_MODEL = os.getenv("TRANSCRIBE_MODEL", "whisper-1")
 
-# Модель для генерации картинок (можно переопределить через .env)
-IMAGE_MODEL = os.getenv("IMAGE_MODEL", "google/gemini-2.5-flash-preview")
+# Картинки: "images" — OpenAI-совместимый /images/generations,
+#           "chat"   — режим OpenRouter (modalities=["image","text"])
+IMAGE_API = os.getenv("IMAGE_API", "images").strip().lower()
+IMAGE_MODEL = os.getenv("IMAGE_MODEL", "dall-e-3")
+IMAGE_SIZE = os.getenv("IMAGE_SIZE", "1024x1024")
 
 SYSTEM_INSTRUCTION = (
     "Ты — личный ассистент программиста. Если тебя просят написать программу или исправить код, "
@@ -305,7 +327,7 @@ def get_message_ids(user_id: int) -> list[int]:
     return [row[0] for row in rows]
 
 
-def get_history_for_openrouter(user_id: int) -> list:
+def get_history_for_ai(user_id: int) -> list:
     conn = sqlite3.connect("chat_history.db")
     cursor = conn.cursor()
     cursor.execute(
@@ -422,8 +444,11 @@ async def handle_code_blocks(message: types.Message, ai_text: str):
 IMAGE_KEYWORDS = [
     "нарисуй", "нарисовать", "изобрази",
     "создай картинку", "создай изображение", "создай рисунок",
+    "сгенерируй картинку", "сгенерируй изображение", "сгенерируй рисунок",
+    "сделай картинку", "сделай изображение",
     "покажи картинку", "покажи рисунок",
-    "draw me", "draw a", "draw an", "generate image", "create image", "make an image",
+    "draw me", "draw a", "draw an", "generate image", "generate an image",
+    "create image", "create an image", "make an image",
 ]
 
 
@@ -436,7 +461,7 @@ def translate_to_english(text: str) -> str:
     """Переводит текст на английский через ИИ"""
     try:
         tr = ai_client.chat.completions.create(
-            model=MODEL_NAME,
+            model=CHAT_MODEL,
             messages=[
                 {
                     "role": "system",
@@ -464,37 +489,52 @@ def translate_to_english(text: str) -> str:
 
 
 def generate_image(prompt: str) -> bytes:
-    """Генерирует картинку через OpenRouter"""
+    """Генерирует картинку у провайдера и возвращает её байты."""
     english_prompt = translate_to_english(prompt)
 
-    response = ai_client.chat.completions.create(
-        model=IMAGE_MODEL,
-        messages=[{"role": "user", "content": english_prompt}],
-        extra_body={"modalities": ["image", "text"]},
-        max_tokens=512,
-    )
-
-    for choice in response.choices:
-        msg = choice.message
-        if isinstance(msg.content, list):
-            for block in msg.content:
-                if isinstance(block, dict) and block.get("type") == "image_url":
-                    img_url = block["image_url"]["url"]
-                    if img_url.startswith("data:"):
-                        b64 = img_url.split(",", 1)[1]
-                        return base64.b64decode(b64)
-                    else:
-                        with urllib.request.urlopen(img_url, timeout=30) as r:
+    if IMAGE_API == "chat":
+        # Режим OpenRouter: картинка приходит прямо в ответе чата
+        response = ai_client.chat.completions.create(
+            model=IMAGE_MODEL,
+            messages=[{"role": "user", "content": english_prompt}],
+            extra_body={"modalities": ["image", "text"]},
+            max_tokens=512,
+        )
+        for choice in response.choices:
+            content = choice.message.content
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "image_url":
+                        img_url = block["image_url"]["url"]
+                        if img_url.startswith("data:"):
+                            return base64.b64decode(img_url.split(",", 1)[1])
+                        with urllib.request.urlopen(img_url, timeout=60) as r:
                             return r.read()
+        raise ValueError("Модель не вернула картинку. Попробуй другой запрос.")
 
-    raise ValueError("Модель не вернула картинку. Попробуй другой запрос.")
+    # Режим OpenAI-совместимого /images/generations (ProxyAPI, OpenAI, Cloud.ru и др.)
+    response = ai_client.images.generate(
+        model=IMAGE_MODEL,
+        prompt=english_prompt,
+        size=IMAGE_SIZE,
+        n=1,
+    )
+    item = response.data[0]
+    b64 = getattr(item, "b64_json", None)
+    if b64:
+        return base64.b64decode(b64)
+    url = getattr(item, "url", None)
+    if url:
+        with urllib.request.urlopen(url, timeout=60) as r:
+            return r.read()
+    raise ValueError("Провайдер не вернул ни b64_json, ни url картинки.")
 
 
 def call_ai_with_history(user_id: int, new_user_text: str) -> str:
-    messages = get_history_for_openrouter(user_id)
+    messages = get_history_for_ai(user_id)
     messages.append({"role": "user", "content": new_user_text})
     response = ai_client.chat.completions.create(
-        model=MODEL_NAME, messages=messages, max_tokens=2048
+        model=CHAT_MODEL, messages=messages, max_tokens=2048
     )
     return response.choices[0].message.content
 
@@ -515,7 +555,7 @@ def call_ai_with_image(img_bytes: bytes, user_comment: str) -> str:
         },
     ]
     response = ai_client.chat.completions.create(
-        model="google/gemma-3-12b-it:free", messages=messages, max_tokens=2048
+        model=VISION_MODEL, messages=messages, max_tokens=2048
     )
     return response.choices[0].message.content
 
@@ -523,7 +563,7 @@ def call_ai_with_image(img_bytes: bytes, user_comment: str) -> str:
 @dp.message(CommandStart())
 async def start_handler(message: types.Message):
     await message.answer(
-        "👋 Привет! Я твой ИИ-помощник на базе OpenRouter.\n\n"
+        "👋 Привет! Я твой ИИ-помощник.\n\n"
         "🧠 *Помню контекст разговора* — не нужно повторять себя.\n"
         "📸 *Анализ скриншотов* — отправь фото с вопросом в подписи.\n"
         "🎤 *Голосовые сообщения* — просто надиктуй вопрос.\n"
@@ -626,7 +666,7 @@ async def voice_handler(message: types.Message):
             audio_file = io.BytesIO(audio_bytes)
             audio_file.name = "voice.ogg"
             transcript = ai_client.audio.transcriptions.create(
-                model="openai/whisper-1", file=audio_file
+                model=TRANSCRIBE_MODEL, file=audio_file
             )
             return transcript.text
 
@@ -703,7 +743,7 @@ async def text_processing(user_id: int, user_text: str, message: types.Message):
             error_text = str(e)
             hint = ""
             if "402" in error_text or "insufficient" in error_text.lower():
-                hint = "\n💡 Похоже, у ключа закончились кредиты OpenRouter."
+                hint = "\n💡 Похоже, у ключа закончились кредиты на генерацию картинок."
             elif "404" in error_text or "not found" in error_text.lower():
                 hint = f"\n💡 Модель {IMAGE_MODEL} недоступна — задай другую через IMAGE_MODEL в .env."
             await message.answer(f"❌ Не удалось нарисовать: {error_text}{hint}")
@@ -750,12 +790,13 @@ async def main():
     init_db()
 
     print("=" * 50)
-    print(f"✅ Бот запущен на модели {MODEL_NAME}")
+    print(f"✅ Бот запущен на модели {CHAT_MODEL}")
+    print(f"🤖 Провайдер: {AI_BASE_URL}")
     print("=" * 50)
     print("🧠 Контекст диалога: активен")
-    print("🎤 Голосовые сообщения: активны (Whisper)")
+    print(f"🎤 Голосовые сообщения: активны ({TRANSCRIBE_MODEL})")
     print("📄 PDF: активен (pypdf)")
-    print(f"🎨 Картинки: {IMAGE_MODEL}")
+    print(f"🎨 Картинки: {IMAGE_MODEL} (режим {IMAGE_API})")
     print(f"🌤 Погода: {'активна (WeatherAPI)' if WEATHER_API_KEY else 'не настроена'}")
     print("=" * 50)
 
