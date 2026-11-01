@@ -13,8 +13,11 @@ from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import BufferedInputFile, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.exceptions import TelegramNetworkError
 from openai import OpenAI
 import os
+import importlib.util
 import socket
 import ssl
 
@@ -94,6 +97,10 @@ socket.getaddrinfo = _patched_getaddrinfo
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 WEATHER_API_KEY = os.getenv("WEATHER_API_KEY")
 
+# Прокси только для Telegram (если провайдер блокирует api.telegram.org).
+# Примеры: socks5://127.0.0.1:1080, http://127.0.0.1:8080, http://user:pass@host:port
+TELEGRAM_PROXY = os.getenv("TELEGRAM_PROXY", "").strip()
+
 # === Провайдер моделей: любой OpenAI-совместимый API ===
 # По умолчанию ProxyAPI (работает из РФ). Вернуть OpenRouter можно двумя строками в .env:
 #   AI_BASE_URL=https://openrouter.ai/api/v1
@@ -108,7 +115,23 @@ AI_API_KEY = (
 if not TELEGRAM_TOKEN or not AI_API_KEY:
     raise RuntimeError("❌ Не найдены TELEGRAM_TOKEN или AI_API_KEY в файле .env")
 
-bot = Bot(token=TELEGRAM_TOKEN)
+def mask_proxy(url: str) -> str:
+    """Скрывает логин и пароль в адресе прокси для логов."""
+    return re.sub(r"//([^/@]+)@", "//***@", url)
+
+
+def create_bot() -> Bot:
+    if not TELEGRAM_PROXY:
+        return Bot(token=TELEGRAM_TOKEN)
+    if importlib.util.find_spec("aiohttp_socks") is None:
+        raise RuntimeError(
+            "❌ Для TELEGRAM_PROXY нужен пакет aiohttp-socks: pip install aiohttp-socks"
+        )
+    print(f"🔌 Telegram через прокси: {mask_proxy(TELEGRAM_PROXY)}")
+    return Bot(token=TELEGRAM_TOKEN, session=AiohttpSession(proxy=TELEGRAM_PROXY))
+
+
+bot = create_bot()
 dp = Dispatcher(storage=MemoryStorage())
 
 ai_client = OpenAI(base_url=AI_BASE_URL, api_key=AI_API_KEY)
@@ -792,6 +815,7 @@ async def main():
     print("=" * 50)
     print(f"✅ Бот запущен на модели {CHAT_MODEL}")
     print(f"🤖 Провайдер: {AI_BASE_URL}")
+    print(f"🔌 Telegram: {'через прокси ' + mask_proxy(TELEGRAM_PROXY) if TELEGRAM_PROXY else 'напрямую'}")
     print("=" * 50)
     print("🧠 Контекст диалога: активен")
     print(f"🎤 Голосовые сообщения: активны ({TRANSCRIBE_MODEL})")
@@ -800,7 +824,16 @@ async def main():
     print(f"🌤 Погода: {'активна (WeatherAPI)' if WEATHER_API_KEY else 'не настроена'}")
     print("=" * 50)
 
-    await dp.start_polling(bot)
+    while True:
+        try:
+            await dp.start_polling(bot)
+            break
+        except TelegramNetworkError as e:
+            print(f"\n⚠️ Нет связи с api.telegram.org: {e}")
+            print("   Включи VPN или укажи прокси в .env, например:")
+            print("   TELEGRAM_PROXY=socks5://127.0.0.1:1080")
+            print("   Повтор через 30 секунд...")
+            await asyncio.sleep(30)
 
 
 if __name__ == "__main__":
