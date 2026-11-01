@@ -96,6 +96,9 @@ IMAGE_SIZE=1024x1024
 
 # Погода
 WEATHER_API_KEY=...                       # ключ с weatherapi.com
+
+# Если провайдер блокирует api.telegram.org — прокси только для Telegram
+# TELEGRAM_PROXY=socks5://127.0.0.1:1080
 ```
 
 | Переменная | Обязательна | По умолчанию | Назначение |
@@ -110,6 +113,7 @@ WEATHER_API_KEY=...                       # ключ с weatherapi.com
 | `IMAGE_MODEL` | ❌ | `dall-e-3` | Модель генерации картинок |
 | `IMAGE_SIZE` | ❌ | `1024x1024` | Размер картинки |
 | `WEATHER_API_KEY` | ❌ | — | [WeatherAPI](https://www.weatherapi.com/) — без него погода отключена |
+| `TELEGRAM_PROXY` | ❌ | — | Прокси только для Telegram: `socks5://127.0.0.1:1080`, `http://host:port`. Нужен, если провайдер блокирует `api.telegram.org` |
 
 > ⚠️ `.env` содержит секреты. Не коммить его: добавь в `.gitignore` строку `.env`.
 
@@ -135,7 +139,7 @@ python bot.py
 
 ## Как это устроено
 
-- **Транспорт** — long polling aiogram 3, `MemoryStorage`.
+- **Транспорт** — long polling aiogram 3, `MemoryStorage`. При заданном `TELEGRAM_PROXY` создаётся `AiohttpSession` с прокси; запросы к моделям идут напрямую.
 - **Модели** — один клиент `OpenAI(base_url=AI_BASE_URL, api_key=AI_API_KEY)`, модели переключаются переменными окружения.
 - **История** — SQLite-файл `chat_history.db`, таблица `history(user_id, role, text, timestamp, message_id)`. Хранится последние 20 сообщений на пользователя.
 - **Длинные ответы** — режутся на части по 4000 символов (лимит Telegram).
@@ -161,6 +165,32 @@ IMAGE_MODEL=google/gemini-2.5-flash-preview
 ```
 
 После смены провайдера запусти `python check_keys.py` — он покажет, какие модели реально доступны по твоему ключу.
+
+---
+
+## Если Telegram не подключается
+
+Симптом в логе:
+
+```
+aiogram.exceptions.TelegramNetworkError: HTTP Client says - ClientConnectorError:
+Cannot connect to host api.telegram.org:443 ssl:default [Превышен таймаут семафора]
+```
+
+DNS при этом работает, а TCP до `api.telegram.org` не проходит — значит провайдер режет доступ. Варианты:
+
+1. **VPN в режиме TUN** — весь трафик идёт через туннель, настраивать бота не нужно.
+2. **Прокси только для Telegram** — укажи в `.env`:
+
+```env
+TELEGRAM_PROXY=socks5://127.0.0.1:1080
+```
+
+Подойдёт `socks5://` или `http://`, с логином и паролем тоже: `http://user:pass@host:port`. Нужен пакет `aiohttp-socks` — он уже в `requirements.txt`.
+
+Модели при этом ходят напрямую: ProxyAPI доступен из России, прокси ему не нужен.
+
+Бот больше не завершается при сетевой ошибке: печатает предупреждение и повторяет подключение каждые 30 секунд.
 
 ---
 
